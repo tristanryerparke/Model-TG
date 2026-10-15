@@ -12507,7 +12507,8 @@ MFX_SHOW = 1500                   | blocks: a knob's value shows for a second
 MFX_STEP = 1024                   | wet ramp: 64 samples end to end, Q16
 
 | mfx_knob (d3 = knob index, d2 = the encoder event) -> d0 = 1 if it did
-| something (redraw). Keeps d2-d7.
+| something (redraw). Panel changes are converted to absolute values and use
+| the same setter as MIDI; coefficient work therefore always stays on UI.
 mfx_knob:
     pea     4                     | clicks: 1 each slowly, 4 turned fast
     pea     1
@@ -12516,8 +12517,18 @@ mfx_knob:
     lea.l   %sp@(12),%sp
     tstl    %d0
     beqw    mfk_no
+    bsr     mfx_delta              | d0 delta -> current absolute value
+    bsr     mfx_set
+    moveq   #1,%d0
+    rts
+mfk_no:
+    moveq   #0,%d0
+    rts
+
+| mfx_set (d3 = MFX knob index, d0 = absolute value). UI task only.
+mfx_set:
     cmpil   #6,%d3
-    beqs    mfk_filt
+    beqw    mfk_filt
     cmpil   #7,%d3
     beqw    mfk_res
     cmpil   #2,%d3
@@ -12540,11 +12551,161 @@ mfx_knob:
     beqw    mfk_vinyl
     cmpil   #13,%d3
     beqw    mfk_flg
-mfk_no:
-    moveq   #0,%d0
+    rts
+
+| mfx_delta (d3 = knob index, d0 = encoder delta) -> absolute value.
+| Gate is ordinal, so a turn changes it by one irrespective of encoder speed.
+mfx_delta:
+    cmpil   #10,%d3
+    beqw    mfd_gate
+    lea.l   mfx_val_ptrs,%a0
+    movea.l %a0@(0,%d3:l:4),%a0
+    tstl    %a0
+    beqw    mfk_no
+    addl    %a0@,%d0
+    rts
+mfd_gate:
+    moveq   #1,%d1
+    tstl    %d0
+    bpls    mfd_g1
+    moveq   #-1,%d1
+mfd_g1:
+    addl    mfx_gate,%d1
+    movel   %d1,%d0
+    rts
+
+| mfx_midi_batch is entered at the stock parser's batch finalization with
+| d5 = first 4-byte record and d2 = byte count. It only coalesces channel-7
+| CC20..31 and schedules work; no MFX state or audio coefficient is touched.
+mfx_midi_batch:
+    lea.l   %sp@(-28),%sp
+    moveml  %d0-%d4/%a0-%a1,%sp@
+    movea.l %d5,%a0
+    movel   %d2,%d4
+mmb_l:
+    tstl    %d4
+    beqw    mmb_post
+    cmpib   #11,%a0@              | parser record type: controller
+    bnew    mmb_n
+    cmpib   #0xb6,%a0@(1)         | MIDI channel 7 only
+    bnew    mmb_n
+    mvzb    %a0@(2),%d1
+    subil   #20,%d1
+    bmis    mmb_n
+    cmpil   #11,%d1
+    bgts    mmb_n
+    mvzb    %a0@(3),%d0
+    lea.l   mfx_midi_vals,%a1
+    movel   %d0,%a1@(0,%d1:l:4)
+    bset    %d1,mfx_midi_dirty
+mmb_n:
+    lea.l   %a0@(4),%a0
+    subql   #4,%d4
+    braw    mmb_l
+mmb_post:
+    tstl    mfx_midi_dirty
+    beqw    mmb_out
+    bsr     mfx_midi_post
+mmb_out:
+    moveml  %sp@,%d0-%d4/%a0-%a1
+    lea.l   %sp@(28),%sp
+    tstl    %d2                   | replay replaced stock instructions
+    beqw    mmb_empty
+    jmp     0x40003666
+mmb_empty:
+    jmp     0x40003674
+
+| Post one type-6 callback. The message's busy word coalesces parser batches.
+mfx_midi_post:
+    lea.l   mfx_midi_msg,%a0
+    tstl    %a0@(0x18)
+    bnes    mmp_out
+    movel   %a0,%sp@-
+    pea     1
+    jsr     ALLOC
+    addql   #4,%sp
+    movea.l %sp@+,%a0
+    movel   %d0,%a0@(4)
+    clrl    %a0@(8)
+    movel   #GENERIC_MANAGER,%d0
+    movel   %d0,%a0@(0x0c)
+    movel   #mfx_midi_run,%d0
+    movel   %d0,%a0@(0x10)
+    clrl    %a0@(0x14)
+    moveq   #1,%d0
+    movel   %d0,%a0@(0x18)
+    moveq   #6,%d0
+    moveb   %d0,%a0@
+    movel   %a0,%sp@-
+    pea     MQ_MAIN
+    jsr     0x40001fba
+    addql   #8,%sp
+mmp_out:
+    rts
+
+| UI callback: consume the latest values and run the common absolute setter.
+mfx_midi_run:
+    lea.l   %sp@(-20),%sp
+    moveml  %d2-%d4/%a2,%sp@
+    lea.l   mfx_midi_vals,%a2
+    moveq   #0,%d3
+mmr_l:
+    btst    %d3,mfx_midi_dirty
+    beqw    mmr_n
+    bclr    %d3,mfx_midi_dirty
+    movel   %a2@(0,%d3:l:4),%d0
+    cmpil   #4,%d3                | CC24 Filter: LP max, off, HP max
+    beqw    mmr_filt
+    cmpil   #8,%d3                | CC28 Gate: map to six divisions
+    beqw    mmr_gate
+    braw    mmr_set
+mmr_filt:
+    cmpil   #64,%d0
+    beqw    mmr_f0
+    bgts    mmr_fhp
+    moveq   #127,%d1
+    mulul   %d1,%d0
+    moveq   #64,%d1
+    divul   %d1,%d0
+    moveq   #127,%d1
+    subl    %d0,%d1
+    movel   %d1,%d0
+    negl    %d0
+    braw    mmr_set
+mmr_f0:
+    clrl    %d0
+    braw    mmr_set
+mmr_fhp:
+    subil   #64,%d0
+    moveq   #127,%d1
+    mulul   %d1,%d0
+    moveq   #63,%d1
+    divul   %d1,%d0
+    braw    mmr_set
+mmr_gate:
+    tstl    %d0
+    beqw    mmr_set
+    subql   #1,%d0
+    moveq   #21,%d1
+    divul   %d1,%d0               | 1-21, 22-42, ... 106-127
+    addql   #1,%d0
+    cmpil   #6,%d0
+    bles    mmr_set
+    moveq   #6,%d0
+mmr_set:
+    movel   %d3,%d4               | keep the CC slot across the setter
+    lea.l   mfx_midi_knobs,%a0
+    movel   %a0@(0,%d3:l:4),%d3
+    bsr     mfx_set
+    movel   %d4,%d3
+mmr_n:
+    addql   #1,%d3
+    cmpil   #12,%d3
+    blts    mmr_l
+    moveml  %sp@,%d2-%d4/%a2
+    lea.l   %sp@(20),%sp
     rts
 mfk_filt:
-    addl    mfx_filt,%d0
     cmpil   #127,%d0
     bles    mfk_f1
     moveq   #127,%d0
@@ -12567,7 +12728,6 @@ mfk_hp:
     lea.l   mfx_s_fhp,%a0
     bras    mfk_say
 mfk_res:
-    addl    mfx_res,%d0
     bpls    mfk_r1
     moveq   #0,%d0
 mfk_r1:
@@ -12596,7 +12756,6 @@ mfk_c1:
 mfk_c2:
     rts
 mfk_drv:                          | Drive: gain and its level compensation
-    addl    mfx_drv,%d0
     bsr     mfk_clamp
     movel   %d0,mfx_drv
     lea.l   mfx_dg_t,%a0
@@ -12608,7 +12767,6 @@ mfk_drv:                          | Drive: gain and its level compensation
     lea.l   mfx_s_drv,%a0
     braw    mfk_say
 mfk_crs:                          | Crush: bits = 16 - 15 v / 127, as a mask
-    addl    mfx_crs,%d0
     bsr     mfk_clamp
     movel   %d0,mfx_crs
     moveq   #-1,%d1
@@ -12636,7 +12794,6 @@ mfk_cm:
     lea.l   mfx_s_crs,%a0
     braw    mfk_say
 mfk_rt:                           | Rate: the hold's step, shown in Hz
-    addl    mfx_rt,%d0
     bsr     mfk_clamp
     movel   %d0,mfx_rt
     lea.l   mfx_ri_t,%a0
@@ -12648,27 +12805,21 @@ mfk_rt:                           | Rate: the hold's step, shown in Hz
     lsrl    #8,%d0
     lea.l   mfx_s_rt,%a0
     braw    mfk_say
-mfk_gate:                         | Gate: one division per click
-    moveq   #1,%d1
-    tstl    %d0
-    bpls    mfk_g1
-    moveq   #-1,%d1
-mfk_g1:
-    addl    mfx_gate,%d1
+mfk_gate:                         | Gate: absolute division 0..6
     bpls    mfk_g2
-    moveq   #0,%d1
+    moveq   #0,%d0
 mfk_g2:
-    cmpil   #6,%d1
+    cmpil   #6,%d0
     bles    mfk_g3
-    moveq   #6,%d1
+    moveq   #6,%d0
 mfk_g3:
-    movel   %d1,mfx_gate
+    movel   %d0,mfx_gate
+    movel   %d0,%d1
     lea.l   mfx_gnames,%a0
     movea.l %a0@(0,%d1:l:4),%a0
     moveq   #-1,%d0
     braw    mfk_say
 mfk_tape:                         | Tape stop: the brake, 0..127
-    addl    mfx_tape,%d0
     bsr     mfk_clamp
     movel   %d0,mfx_tape
     lea.l   mfx_s_tape,%a0
@@ -12701,13 +12852,11 @@ mfx_reset:
     moveq   #-1,%d0
     braw    mfx_say
 mfk_pump:                         | Pump: depth 0..127
-    addl    mfx_pump,%d0
     bsr     mfk_clamp
     movel   %d0,mfx_pump
     lea.l   mfx_s_pump,%a0
     braw    mfk_say
 mfk_ring:                         | Ring mod: the sine's frequency, in Hz
-    addl    mfx_ring,%d0
     bsr     mfk_clamp
     movel   %d0,mfx_ring
     beqs    mfk_r0
@@ -12723,7 +12872,6 @@ mfk_r0:
     moveq   #-1,%d0
     braw    mfk_say
 mfk_noise:                        | Noise riser: level (squared) and the
-    addl    mfx_noise,%d0         | high-pass climbing with it
     bsr     mfk_clamp
     movel   %d0,mfx_noise
     lea.l   mfx_nhp_t,%a0
@@ -12740,13 +12888,11 @@ mfk_noise:                        | Noise riser: level (squared) and the
     lea.l   mfx_s_noise,%a0
     braw    mfk_say
 mfk_vinyl:                        | Vinyl: Wear 0..127
-    addl    mfx_vinyl,%d0
     bsr     mfk_clamp
     movel   %d0,mfx_vinyl
     lea.l   mfx_s_vinyl,%a0
     braw    mfk_say
 mfk_flg:                          | Flanger: depth 0..127 -> blend 0..64
-    addl    mfx_flg,%d0
     bsr     mfk_clamp
     movel   %d0,mfx_flg
     movel   %d0,%d1
@@ -13793,6 +13939,13 @@ mfx_g4:        .asciz "GATE 1/16"
 mfx_g5:        .asciz "GATE 1/16T"
 mfx_g6:        .asciz "GATE 1/32"
     .balign 4
+| Panel delta lookup, indexed by the retrig page's MFX knob number.
+mfx_val_ptrs:  .long 0,0,mfx_drv,mfx_crs,mfx_rt,mfx_pump,mfx_filt,mfx_res
+               .long mfx_ring,mfx_noise,mfx_gate,mfx_tape,mfx_vinyl,mfx_flg
+mfx_midi_knobs: .long 2,3,4,5,6,7,8,9,10,11,12,13 | CC20..31
+mfx_midi_dirty: .long 0
+mfx_midi_vals:  .space 12*4
+mfx_midi_msg:   .space 28         | type-6 UI callback message
 mfx_filt:      .long 0            | -127 LP .. 0 off .. 127 HP
 mfx_res:       .long 0            | 0..127
 mfx_on:        .long 0            | the filter is engaged

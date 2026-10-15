@@ -482,6 +482,13 @@ assert bytes(d[0x40059872-BASE:0x40059878-BASE])==bytes.fromhex("4eb9400567ba"),
     bytes(d[0x40059872-BASE:0x40059878-BASE]).hex()
 d[0x40059874-BASE:0x40059878-BASE]=struct.pack('>I',sym['rs_out'])
 print(f"  0x40059872 -> jsr rs_out 0x{sym['rs_out']:08x}")
+# Incoming MIDI parser batch finalization. mfx_midi_batch sees the parser's
+# d5 record buffer and d2 byte count, coalesces only channel-7 CC20..31, posts
+# one UI callback, and then resumes the stock queueing path unchanged.
+_o=0x40003662-BASE
+assert bytes(d[_o:_o+6])==bytes.fromhex("4a82670e42a7"), \
+    bytes(d[_o:_o+6]).hex()
+jmp(0x40003662, sym['mfx_midi_batch'])
 # Stereo Sampler tracks at the mixer: the main mix 0x40056610 (its one caller
 # runs it for bus L, then bus R) enters through sx_mix, which sets each stereo
 # track's channel to L or R first; and the per-track gain `jsr 0x40056d9c` at
